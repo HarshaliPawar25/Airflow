@@ -1,0 +1,198 @@
+Notes : 02:05:2026
+
+✅ What this DAG covers (interviewer checklist)
+
+✔ WRITE_APPEND
+✔ Duplicate avoidance (file metadata + MERGE)
+✔ Late-arriving files (Sensor)
+✔ Partitioned BigQuery table
+✔ Validation checks
+✔ Alerts on failure (email + callback ready)
+✔ Real-world batch ingestion pattern
+
+📌 DAG: batch_gcs_to_bq.py
+from airflow import DAG
+from airflow.utils.dates import days_ago
+from airflow.providers.google.cloud.sensors.gcs import GCSObjectExistenceSensor
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.operators.email import EmailOperator
+from airflow.utils.trigger_rule import TriggerRule
+from datetime import timedelta
+
+📌 Default Arguments (Retries, Alerts)
+default_args = {
+    "owner": "data-engineering",
+    "depends_on_past": False,
+    "email_on_failure": True,
+    "email": ["alerts@company.com"],
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5)
+}
+
+📌 DAG Definition
+with DAG(
+    dag_id="batch_gcs_to_bq",
+    start_date=days_ago(1),
+    schedule_interval="0 2 * * *",  # Daily at 2 AM
+    catchup=False,
+    default_args=default_args,
+    tags=["gcs", "bigquery", "batch"]
+) as dag:
+
+1️⃣ Sensor – Handle Late Arriving Files
+    wait_for_gcs_file = GCSObjectExistenceSensor(
+        task_id="wait_for_gcs_file",
+        bucket="sales-data-bucket",
+        object="sales/{{ ds }}/sales_*.csv",
+        timeout=60 * 60,     # Wait up to 1 hour
+        poke_interval=300   # Check every 5 minutes
+    )
+
+
+💬 Interview explanation
+
+“The pipeline is event-aware. It waits for data instead of failing on fixed schedules.”
+
+2️⃣ Load Data to Staging Table (WRITE_APPEND)
+    load_to_staging = GCSToBigQueryOperator(
+        task_id="load_to_staging",
+        bucket="sales-data-bucket",
+        source_objects=["sales/{{ ds }}/sales_*.csv"],
+        destination_project_dataset_table=
+        "project_id.raw_ds.sales_staging",
+        source_format="CSV",
+        skip_leading_rows=1,
+        write_disposition="WRITE_APPEND",
+        create_disposition="CREATE_IF_NEEDED",
+        time_partitioning={
+            "type": "DAY",
+            "field": "order_date"
+        },
+        schema_fields=[
+            {"name": "order_id", "type": "STRING"},
+            {"name": "customer_id", "type": "STRING"},
+            {"name": "amount", "type": "FLOAT"},
+            {"name": "order_date", "type": "DATE"},
+            {"name": "load_date", "type": "DATE"}
+        ]
+    )
+
+
+💬 Why WRITE_APPEND?
+
+Incremental daily data — we never delete history.
+
+3️⃣ Deduplication using MERGE (Avoid Duplicate Loads)
+    merge_to_target = BigQueryInsertJobOperator(
+        task_id="merge_to_target",
+        configuration={
+            "query": {
+                "query": """
+                MERGE `project_id.curated_ds.sales_target` T
+                USING `project_id.raw_ds.sales_staging` S
+                ON T.order_id = S.order_id
+                WHEN NOT MATCHED THEN
+                  INSERT (order_id, customer_id, amount, order_date, load_date)
+                  VALUES (S.order_id, S.customer_id, S.amount, S.order_date, S.load_date)
+                """,
+                "useLegacySql": False
+            }
+        }
+    )
+
+
+💬 Interview gold line:
+
+“We use MERGE to ensure idempotency and safely handle re-runs.”
+
+4️⃣ Data Validation (Fail if No Data Loaded)
+    validate_data = BigQueryInsertJobOperator(
+        task_id="validate_data",
+        configuration={
+            "query": {
+                "query": """
+                SELECT
+                IF(COUNT(*) = 0,
+                   ERROR('No data loaded'),
+                   COUNT(*))
+                FROM `project_id.curated_ds.sales_target`
+                WHERE load_date = CURRENT_DATE()
+                """,
+                "useLegacySql": False
+            }
+        }
+    )
+
+
+💬 Why this matters:
+
+Validation failures stop bad data from reaching consumers.
+
+5️⃣ Alert on Validation Failure
+    alert_failure = EmailOperator(
+        task_id="alert_failure",
+        to="alerts@company.com",
+        subject="BigQuery Data Validation Failed",
+        html_content="Sales pipeline validation failed. Immediate action required.",
+        trigger_rule=TriggerRule.ONE_FAILED
+    )
+
+📌 Task Dependency Flow
+    wait_for_gcs_file \
+        >> load_to_staging \
+        >> merge_to_target \
+        >> validate_data \
+        >> alert_failure
+
+########################
+1️⃣ What does Idempotency mean? (Interview-ready)
+Simple definition
+
+Idempotency means running the same job multiple times produces the same final result.
+
+No duplicates.
+No corruption.
+No side effects.
+
+In Data Engineering terms
+
+If:
+
+Airflow retries
+
+DAG is backfilled
+
+Job is manually re-run
+
+File is re-delivered
+
+👉 Target table remains correct
+
+Example (BigQuery)
+
+❌ NOT idempotent
+
+INSERT INTO sales_target
+SELECT * FROM sales_staging;
+
+
+If run twice → duplicate data
+
+✅ Idempotent
+
+MERGE sales_target T
+USING sales_staging S
+ON T.order_id = S.order_id
+WHEN NOT MATCHED THEN
+  INSERT (...)
+
+
+✔ Re-run safe
+✔ Retry safe
+✔ Backfill safe
+
+One-liner for interview
+
+“Idempotency ensures retries and re-runs don’t introduce duplicate or inconsistent data.”
+##############################################################################################################
