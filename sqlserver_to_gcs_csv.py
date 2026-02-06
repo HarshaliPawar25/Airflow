@@ -56,6 +56,7 @@ with DAG(
         sql="""
             SELECT *
             FROM dbo.customer
+            --WHERE updated_at >= '{{ ds }}' --increment
         """,
 
         # GCS bucket name
