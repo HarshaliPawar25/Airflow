@@ -1,0 +1,82 @@
+How Connection Details Are Defined (VERY IMPORTANT)
+In Cloud Composer:
+All credentials live in Airflow Connections
+DAG only references conn_id
+Admin → Connections → + Add
+Step 2: Fill Details
+Field	Value
+Conn Id	mssql_prod
+Conn Type	Microsoft SQL Server
+Host	sqlserver.bank.internal
+Schema	coredb
+Login	etl_user
+Password	🔒 (secret)
+Port	1433
+
+This is a very sharp question — you’re basically asking:
+“If the DAG is scheduled only once per day at 2 AM, why do we even need max_active_runs = 1?”
+Let’s answer this slowly, logically, and with real production truth, not theory.
+🔑 Short truth (but deep meaning)
+Scheduling controls when a DAG is triggered.
+max_active_runs controls how many times it is allowed to run concurrently.
+Even a “once-a-day” DAG can accidentally run more than once at the same time.
+🧠 Why scheduling alone is NOT enough
+You are assuming:
+One trigger at 2 AM
+Previous run always finishes before next trigger
+No manual triggers
+No retries extending runtime
+No backfill
+No failures
+❌ Production never behaves this cleanly
+🔥 Real Productio Scenarios (This is why max_active_runs exists)
+1️⃣ DAG runs longer than expected
+Day 1 – 2:00 AM → DAG starts
+Day 1 – 4:30 AM → DAG still running
+Day 2 – 2:00 AM → Scheduler triggers next run
+Without max_active_runs=1:
+Day 1 run still running
+Day 2 run starts
+Same pipeline running twice ❌
+With max_active_runs=1:
+Day 2 run is queued
+Starts only after Day 1 finishes ✅
+2️⃣ Manual trigger by engineer
+2:00 AM → Scheduled run starts
+2:15 AM → Engineer clicks "Trigger DAG"
+Without max_active_runs=1:
+Two runs overlap ❌
+With it:
+Manual run waits ✅
+3️⃣ Backfill / Catchup enabled
+DAG paused for 5 days
+Unpaused → 5 DAG runs scheduled instantly
+Without max_active_runs=1:
+All 5 runs execute in parallel ❌
+With it:
+Runs execute one-by-one ✅
+4️⃣ Retry + Long Retry Delay
+2:00 AM → Run starts
+2:10 AM → Task fails
+Retry delay = 30 mins
+2:40 AM → Retry happens
+Meanwhile:
+2:00 AM next day → New scheduled ru
+Overlap happens without control ❌
+📌 Key Insight (Very Important)
+Schedule interval ≠ execution guarantee
+Airflow scheduler:
+Only creates DAG runs
+Does NOT ensure old run finished
+That’s YOUR responsibility.
+🧪 Visual Timeline
+❌ Without max_active_runs
+Day 1 Run ────────────────┐
+                          ├── Overlap ❌
+Day 2 Run ────────────────┘
+
+✅ With max_active_runs=1
+Day 1 Run ────────────────┐
+                          └── Day 2 waits
+Day 2 Run      ────────────
+
